@@ -12,7 +12,7 @@ TG_CHAT  = os.environ.get("TG_CHAT", "")
 sent_slugs = set()
 last_reset_day = None
 trades_today = 0
-MAX_TRADES = 8
+MAX_TRADES = 10
 
 # ── Utils ─────────────────────────────────────────────────────────────────────
 def now_str():
@@ -43,9 +43,14 @@ def reset_daily():
         sent_slugs = set()
         trades_today = 0
         last_reset_day = today
-        print(f"Daily reset — {today}")
+        print(f"Daily reset - {today}")
+        send_telegram(f"🌅 New day! Bot reset. Targeting 8-10 best trades today.")
 
 # ── Score market ──────────────────────────────────────────────────────────────
+# Strategy: find the BEST value trades
+# Best value = you are betting on something at low odds that has real chance
+# We look at BOTH sides - maybe YES is 30c but NO is 70c
+# We pick whichever side gives best value
 def score_market(m):
     try:
         prices = m.get("outcomePrices")
@@ -54,38 +59,87 @@ def score_market(m):
         p = json.loads(prices) if isinstance(prices, str) else prices
         yes = float(p[0])
         no  = float(p[1])
-        edge = abs(yes - 0.5)
 
-        # Need at least slight edge (55c+)
-        if edge < 0.05:
+        # Skip near-certain outcomes (above 90c) - tiny payout
+        # Skip near-impossible (below 5c) - too risky
+        if yes > 0.92 or yes < 0.05:
+            return None
+        if no > 0.92 or no < 0.05:
             return None
 
         # Volume
         vol = float(m.get("volume") or 0) + float(m.get("volume24hr") or 0)
-        if vol < 200:
+        if vol < 1000:  # need at least $1K traded for reliability
             return None
 
-        # Time — be very flexible, just needs to be active
+        # Time remaining
         end_iso = m.get("endDateIso") or m.get("endDate")
-        hours_left = 12  # default if no end date
+        hours_left = 24
         if end_iso:
             try:
                 end_dt = datetime.fromisoformat(str(end_iso).replace("Z", "+00:00"))
                 now_dt = datetime.now(timezone.utc)
                 hours_left = (end_dt - now_dt).total_seconds() / 3600
-                # Skip if already ended or more than 7 days away
                 if hours_left < 0 or hours_left > 168:
                     return None
             except:
                 pass
 
-        vol_score = min(vol / 20000, 1.0)
-        time_score = 1.0 if hours_left <= 24 else (0.7 if hours_left <= 72 else 0.4)
-        score = (edge * 0.6) + (vol_score * 0.25) + (time_score * 0.15)
+        # ── Pick the best side to bet ─────────────────────────────────────────
+        # "Value" side = the underdog with real chance
+        # If YES=40c NO=60c → bet YES (underdog, bigger payout)
+        # If YES=65c NO=35c → bet NO (underdog, bigger payout)
+        # If YES=50c NO=50c → pick YES (coin flip, still worth if vol high)
 
-        call = "YES" if yes >= 0.5 else "NO"
-        call_odds = yes if call == "YES" else no
-        confidence = min(int(40 + edge * 110 + vol_score * 20), 93)
+        # We always pick the LOWER odds side (bigger payout) 
+        # but only if it's not below 15c (too risky)
+        if yes <= no:
+            call = "YES"
+            call_odds = yes
+            other_odds = no
+        else:
+            call = "NO"
+            call_odds = no
+            other_odds = yes
+
+        # Floor: dont bet on anything below 15c (too unlikely)
+        if call_odds < 0.15:
+            # Try the other side instead
+            call = "YES" if call == "NO" else "NO"
+            call_odds, other_odds = other_odds, call_odds
+            if call_odds < 0.15:
+                return None
+
+        # Payout if you win: bet $100 at 30c = get $333 back = +$233
+        payout_multiplier = round(1 / call_odds, 2)
+        potential_profit = round((payout_multiplier - 1) * 100, 1)
+
+        # ── Value score ───────────────────────────────────────────────────────
+        # Best trades: 25-55c range on call side = good payout + reasonable chance
+        # Payout score peaks at 25c (4x money) and decreases toward 50c (2x)
+        if call_odds <= 0.30:
+            payout_score = 1.0   # huge payout potential
+        elif call_odds <= 0.45:
+            payout_score = 0.85  # great payout
+        elif call_odds <= 0.55:
+            payout_score = 0.65  # decent payout
+        else:
+            payout_score = 0.4   # smaller payout
+
+        vol_score = min(vol / 50000, 1.0)
+        time_score = 1.0 if hours_left <= 24 else (0.75 if hours_left <= 72 else 0.5)
+
+        score = (payout_score * 0.45) + (vol_score * 0.35) + (time_score * 0.2)
+
+        # Risk label
+        if call_odds < 0.25:
+            risk = "HIGH RISK / HIGH REWARD"
+        elif call_odds < 0.45:
+            risk = "MEDIUM RISK"
+        else:
+            risk = "LOW RISK"
+
+        confidence = min(int(45 + vol_score * 30 + time_score * 15), 90)
 
         return {
             "slug":       m.get("slug", ""),
@@ -93,11 +147,14 @@ def score_market(m):
             "category":   m.get("category") or m.get("tag") or "General",
             "url":        f"https://polymarket.com/event/{m.get('slug','')}",
             "yes": yes, "no": no,
-            "edge": edge, "score": score,
             "call": call, "call_odds": call_odds,
+            "score": score,
             "confidence": confidence,
             "hours_left": hours_left,
             "volume": vol,
+            "potential": potential_profit,
+            "multiplier": payout_multiplier,
+            "risk": risk,
         }
     except Exception as e:
         print(f"Score error: {e}")
@@ -118,11 +175,9 @@ def fetch_top_markets():
         try:
             r = requests.get(url, timeout=15)
             if not r.ok:
-                print(f"Bad response from {url}: {r.status_code}")
                 continue
             markets = r.json()
             if not isinstance(markets, list):
-                print(f"Unexpected response type: {type(markets)}")
                 continue
             print(f"Got {len(markets)} markets from endpoint")
             for m in markets:
@@ -137,7 +192,7 @@ def fetch_top_markets():
         except Exception as e:
             print(f"Fetch error: {e}")
 
-    print(f"Checked {total_checked} markets, found {len(scored)} with edge")
+    print(f"Checked {total_checked} total, found {len(scored)} good value trades")
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored
 
@@ -147,20 +202,23 @@ def build_message(m, trade_num):
     h = m["hours_left"]
     time_str = f"{round(h*60)}min" if h < 1 else f"{round(h)}h"
     vol_str = f"${round(m['volume']/1000)}K" if m["volume"] > 1000 else f"${round(m['volume'])}"
+    risk_emoji = "🔥" if "HIGH" in m["risk"] else "⚡" if "MEDIUM" in m["risk"] else "✅"
 
     return "\n".join([
-        f"🎯 POLYMARKET SIGNAL #{trade_num}",
+        f"💰 SIGNAL #{trade_num} — {risk_emoji} {m['risk']}",
         "",
         f"{emoji} BET {m['call']}",
         "",
         f"📋 {m['question']}",
         "",
-        f"💰 YES {round(m['yes']*100)}¢  /  NO {round(m['no']*100)}¢",
-        f"🎯 Call: {m['call']} @ {round(m['call_odds']*100)}¢",
-        f"📊 Confidence: {m['confidence']}%",
-        f"⏱ Resolves in: ~{time_str}",
-        f"💵 Volume: {vol_str}",
-        f"🗂 Category: {m['category']}",
+        f"📊 YES {round(m['yes']*100)}¢  /  NO {round(m['no']*100)}¢",
+        f"🎯 Your bet: {m['call']} @ {round(m['call_odds']*100)}¢",
+        f"💵 Payout: {m['multiplier']}x your money",
+        f"📈 Profit on $100: +${m['potential']}",
+        f"📈 Profit on $500: +${round(m['potential']*5)}",
+        f"⏱ Resolves: ~{time_str}",
+        f"📉 Volume: {vol_str}",
+        f"🗂 {m['category']}",
         "",
         f"🕐 {now_str()}",
         "",
@@ -180,36 +238,41 @@ def scan():
     markets = fetch_top_markets()
 
     if not markets:
-        print("Zero markets scored — API may be down or all near 50/50")
-        send_telegram(f"⚠️ Bot scanned but found 0 markets with edge at {now_str()}. Will retry in 2hrs.")
+        print("No good value markets found this scan")
         return
 
-    # Pick best unsent market
-    best = None
+    signals_sent = 0
+    max_per_scan = 2
+
     for m in markets:
-        if m["slug"] not in sent_slugs:
-            best = m
+        if signals_sent >= max_per_scan:
             break
+        if trades_today >= MAX_TRADES:
+            break
+        if m["slug"] in sent_slugs:
+            continue
 
-    if not best:
-        print("All good markets already sent today.")
-        return
-
-    print(f"Sending: {best['question'][:60]} | {best['call']} @ {round(best['call_odds']*100)}c | conf {best['confidence']}%")
-    trades_today += 1
-    msg = build_message(best, trades_today)
-    sent = send_telegram(msg)
-    if sent:
-        sent_slugs.add(best["slug"])
+        print(f"Signal: {m['question'][:55]} | BET {m['call']} @ {round(m['call_odds']*100)}c | {m['multiplier']}x | {m['risk']}")
+        trades_today += 1
+        signals_sent += 1
+        msg = build_message(m, trades_today)
+        sent = send_telegram(msg)
+        if sent:
+            sent_slugs.add(m["slug"])
+        time.sleep(3)
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("Polymarket Signal Bot starting...")
-    send_telegram("✅ Bot LIVE! Scanning every 2hrs for best Polymarket trades. Up to 8 signals/day.")
+    send_telegram(
+        "✅ Bot LIVE!\n\n"
+        "Strategy: Best value trades across ALL odds\n"
+        "Targets 15c-85c range — picks highest payout with real chance\n"
+        "8-10 signals per day · Scans every 3 hours"
+    )
 
     scan()
-
-    schedule.every(2).hours.do(scan)
+    schedule.every(3).hours.do(scan)
 
     while True:
         schedule.run_pending()
