@@ -70,7 +70,7 @@ def analyze_market(m):
             end_dt = datetime.fromisoformat(str(end_iso).replace("Z", "+00:00"))
             now_dt = datetime.now(timezone.utc)
             hours_left = (end_dt - now_dt).total_seconds() / 3600
-            if hours_left < 0.25 or hours_left > 12:
+            if hours_left < 0.1 or hours_left > 24:
                 return None
         except:
             return None
@@ -78,56 +78,45 @@ def analyze_market(m):
         vol24 = float(m.get("volume24hr") or 0)
         vol_total = float(m.get("volume") or 0)
 
-        # Minimum liquidity
-        if vol_total < 2000:
+        # Minimum liquidity — lowered so more markets qualify
+        if vol_total < 500:
             return None
 
         # ── Detect odds movement ──────────────────────────────────────────────
-        odds_move = 0      # how much odds moved since last scan
+        odds_move = 0
         odds_direction = None
-        vol_spike = 1.0    # volume spike multiplier
+        vol_spike = 1.0
 
         if slug in odds_history:
             prev = odds_history[slug]
             prev_yes = prev["yes"]
             prev_vol = prev["vol"]
-
-            # How much did YES odds move?
-            odds_move = yes - prev_yes  # positive = moving toward YES
-
-            # Volume spike: how much new volume since last scan
+            odds_move = yes - prev_yes
             new_vol = vol_total - prev_vol
             if prev_vol > 0:
-                vol_spike = max(new_vol / (prev_vol * 0.1 + 1), 1.0)  # normalized spike
-
-            if abs(odds_move) > 0.02:  # meaningful move (2c+)
+                vol_spike = max(new_vol / (prev_vol * 0.1 + 1), 1.0)
+            if abs(odds_move) > 0.01:
                 odds_direction = "YES" if odds_move > 0 else "NO"
 
-        # Update history
         odds_history[slug] = {"yes": yes, "vol": vol_total, "seen_at": time.time()}
 
-        # ── Score based on smart money signals ───────────────────────────────
-        # Signal 1: Strong odds movement (smart money moving in)
-        movement_score = min(abs(odds_move) * 20, 1.0)  # 5c move = 1.0 score
-
-        # Signal 2: Volume spike (money rushing in)
-        vol_spike_score = min((vol_spike - 1) / 5, 1.0)  # 5x spike = 1.0
-
-        # Signal 3: 24hr volume relative to total (fresh activity)
+        # ── Score based on activity + conviction ──────────────────────────────
+        movement_score = min(abs(odds_move) * 20, 1.0)
+        vol_spike_score = min((vol_spike - 1) / 5, 1.0)
         activity_ratio = vol24 / (vol_total + 1)
         activity_score = min(activity_ratio * 3, 1.0)
-
-        # Signal 4: Time pressure (closer to end = more urgency = sharper odds)
         time_score = 1.0 if hours_left <= 3 else (0.8 if hours_left <= 6 else 0.6)
 
-        # Total smart money score
-        score = (movement_score * 0.40) + (vol_spike_score * 0.25) +                 (activity_score * 0.20) + (time_score * 0.15)
+        # Conviction score — how far from 50/50 (always usable signal even with no history)
+        conviction_score = min(abs(yes - 0.5) * 3, 1.0)
 
-        # Need at least some signal
-        if score < 0.1 and not odds_direction:
-            # First scan — no history yet, use activity as base signal
-            if activity_score < 0.3:
-                return None
+        score = (movement_score * 0.25) + (vol_spike_score * 0.15) + \
+                (activity_score * 0.20) + (time_score * 0.15) + (conviction_score * 0.25)
+
+        # Only requirement: must have SOME volume and SOME edge (not exactly 50/50)
+        # This guarantees markets pass even on first scan with no history yet
+        if conviction_score < 0.15 and activity_score < 0.15:
+            return None
 
         # ── Determine which side to bet ───────────────────────────────────────
         # Follow the smart money direction if detected
